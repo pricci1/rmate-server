@@ -35,7 +35,7 @@ fi
 # Built-in defaults (lowest precedence).
 RMATE_HOST="${RMATE_HOST:-127.0.0.1}"
 RMATE_PORT="${RMATE_PORT:-52698}"
-RMATE_EDITOR="${RMATE_EDITOR:-${EDITOR:-zed}}"
+RMATE_EDITOR="${RMATE_EDITOR:-${EDITOR:-nano}}"
 
 # --- Utilities ---
 
@@ -176,7 +176,7 @@ handle_connection() {
     _session_dir=$(mktemp -d "${TMPDIR:-/tmp}/rmate-server.XXXXXX")
 
     # Greeting — identifies this server to the rmate client.
-    printf 'Zed (rmate-server)\n'
+    printf 'rmate-server\n'
 
     # Read incoming commands until stdin EOF (connection closed).
     local cmd

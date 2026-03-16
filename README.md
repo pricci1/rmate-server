@@ -29,7 +29,7 @@ export EDITOR="rmate -w"
 
 - `-H, --host HOST` - Listen address (default: 127.0.0.1)
 - `-p, --port PORT` - Listen port (default: 52698)
-- `-e, --editor CMD` - Editor command (default: zed)
+- `-e, --editor CMD` - Editor command (default: nano)
 - `-h, --help` - Show help
 
 ## System requirements
