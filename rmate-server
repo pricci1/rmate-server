@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+# rmate-server — editor-agnostic listener for the rmate remote editing protocol.
+# Opens files sent by 'rmate' via SSH reverse tunnel in a local editor,
+# and streams file contents back to the remote on each save.
+#
+# SSH tunnel setup:  ssh -R 52698:localhost:52698 user@remote-host
+# Then on remote:    rmate file.txt
+
+PROG="${0##*/}"
+VERSION="0.1.0"
+# Resolve canonical path so socat can re-exec this script per connection.
+SELF="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+
+CONFIG_FILE="${HOME}/.config/rmate-server/config"
+PID_FILE="${XDG_RUNTIME_DIR:-/tmp}/rmate-server.pid"
+LOG_FILE="${XDG_RUNTIME_DIR:-/tmp}/rmate-server.log"
+
+# --- Configuration (precedence: CLI args > env vars > config file > defaults) ---
+
+# Load config file; only sets variables not already present in the environment.
+if [[ -f "$CONFIG_FILE" ]]; then
+    while IFS='=' read -r _k _v; do
+        _k="${_k%%#*}" _k="${_k//[[:space:]]/}"   # strip comments + whitespace
+        [[ -z "$_k" ]] && continue
+        _v="${_v%%#*}" _v="${_v# }" _v="${_v%"${_v##*[![:space:]]}"}"
+        case "$_k" in
+            host)   [[ -z "${RMATE_HOST+x}"   ]] && RMATE_HOST="$_v"   ;;
+            port)   [[ -z "${RMATE_PORT+x}"   ]] && RMATE_PORT="$_v"   ;;
+            editor) [[ -z "${RMATE_EDITOR+x}" ]] && RMATE_EDITOR="$_v" ;;
+        esac
+    done < "$CONFIG_FILE"
+    unset _k _v
+fi
+
+# Built-in defaults (lowest precedence).
+RMATE_HOST="${RMATE_HOST:-127.0.0.1}"
+RMATE_PORT="${RMATE_PORT:-52698}"
+RMATE_EDITOR="${RMATE_EDITOR:-${EDITOR:-zed}}"
+
+# --- Utilities ---
+
+log() {
+    printf '[%s] [%d] %s\n' "$(date '+%H:%M:%S')" "$$" "$*" >> "$LOG_FILE"
+}
+
+die() { echo "$PROG: $*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+Usage: $PROG [OPTIONS] COMMAND
+
+Editor-agnostic rmate server. Receives files from remote machines via SSH
+reverse tunnel and opens them in a local editor. Streams saves back.
+
+SSH setup:
+  ssh -R 52698:localhost:52698 user@remote-host
+  # then on remote: rmate file.txt
+
+Commands:
+  start       Start server in background (default)
+  stop        Stop background server
+  status      Show server status
+  foreground  Run in foreground (for debugging)
+
+Options:
+  -H, --host HOST     Listen address  (default: $RMATE_HOST)
+  -p, --port PORT     Listen port     (default: $RMATE_PORT)
+  -e, --editor CMD    Editor command  (default: $RMATE_EDITOR)
+  -h, --help          Show this help
+
+Config file:  $CONFIG_FILE  (key=value: host, port, editor)
+Environment:  RMATE_HOST, RMATE_PORT, RMATE_EDITOR
+EOF
+    exit 0
+}
+
+# --- Protocol helpers ---
+
+# Send a save response with the current file contents.
+# Format (per RemoteSubl/rmate protocol):
+#   save\ntoken: T\ndata: N\n<N bytes>\n
+# The trailing \n is the blank-line terminator consumed by the client's read loop.
+send_save() {
+    local path="$1" token="$2"
+    local size
+    size=$(wc -c < "$path")
+    printf 'save\ntoken: %s\ndata: %d\n' "$token" "$size"
+    cat "$path"
+    printf '\n'
+}
+
+# Send a close notification.
+send_close() {
+    printf 'close\ntoken: %s\n\n' "$1"
+}
+
+# --- Editor invocation ---
+
+# Open a file in the configured editor at an optional line number.
+# All editors are opened asynchronously — GUI apps run directly,
+# terminal editors are spawned in a new terminal window.
+open_in_editor() {
+    local path="$1" selection="${2:-}"
+    local editor="$RMATE_EDITOR"
+    local name="${editor##*/}"
+
+    case "$name" in
+        zed)
+            # zed accepts file:line[:col]
+            [[ -n "$selection" ]] && path="${path}:${selection}"
+            "$editor" "$path" </dev/null &>/dev/null &
+            ;;
+        code)
+            if [[ -n "$selection" ]]; then
+                "$editor" --goto "${path}:${selection}" </dev/null &>/dev/null &
+            else
+                "$editor" "$path" </dev/null &>/dev/null &
+            fi
+            ;;
+        subl)
+            [[ -n "$selection" ]] && path="${path}:${selection}"
+            "$editor" "$path" </dev/null &>/dev/null &
+            ;;
+        vim|vi|nvim|nano|emacs|pico|joe|ne|micro|helix|hx)
+            # Terminal editors need a real TTY; wrap in a terminal emulator.
+            local term
+            for term in x-terminal-emulator xterm gnome-terminal konsole \
+                        alacritty kitty foot wezterm; do
+                command -v "$term" &>/dev/null || continue
+                case "$term" in
+                    gnome-terminal) "$term" -- "$editor" "$path" </dev/null &>/dev/null & ;;
+                    *)              "$term" -e "$editor" "$path" </dev/null &>/dev/null & ;;
+                esac
+                break
+            done
+            ;;
+        *)
+            # Unknown editor — assume GUI-like, open directly.
+            "$editor" "$path" </dev/null &>/dev/null &
+            ;;
+    esac
+    disown 2>/dev/null || true
+}
+
+# --- Connection handler ---
+# Runs once per socat fork with stdin/stdout wired to the network socket.
+
+# Global arrays for the connection handler. Must be global so the EXIT trap
+# can access them after handle_connection returns to the top-level shell.
+_tokens=()
+_temp_paths=()
+_watcher_pids=()
+_session_dir=""
+
+_cleanup() {
+    local i
+    for i in "${!_watcher_pids[@]}"; do
+        kill "${_watcher_pids[$i]}" 2>/dev/null
+    done
+    # Best-effort close notifications (socket may already be gone).
+    for i in "${!_tokens[@]}"; do
+        send_close "${_tokens[$i]}" 2>/dev/null || true
+    done
+    [[ -n "$_session_dir" ]] && rm -rf "$_session_dir"
+    # Clear so a double-trap-fire is a no-op.
+    _tokens=() _watcher_pids=() _session_dir=""
+}
+trap _cleanup EXIT HUP TERM
+
+handle_connection() {
+    _session_dir=$(mktemp -d "${TMPDIR:-/tmp}/rmate-server.XXXXXX")
+
+    # Greeting — identifies this server to the rmate client.
+    printf 'Zed (rmate-server)\n'
+
+    # Read incoming commands until stdin EOF (connection closed).
+    local cmd
+    while IFS= read -r cmd; do
+        cmd="${cmd%$'\r'}"
+        [[ -z "$cmd" ]] && continue
+
+        if [[ "$cmd" != "open" ]]; then
+            log "ignoring unknown command: $cmd"
+            # Drain headers to stay in sync with the stream.
+            local _drain
+            while IFS= read -r _drain; do
+                [[ "${_drain%$'\r'}" == "" ]] && break
+            done
+            continue
+        fi
+
+        # Parse headers for this 'open' command.
+        local token="" display_name="" selection="" temp_path=""
+        local key val line
+
+        while IFS= read -r line; do
+            line="${line%$'\r'}"
+            [[ -z "$line" ]] && break          # blank line ends headers
+
+            key="${line%%:*}"
+            val="${line#*:}"
+            val="${val# }"                     # strip one leading space
+
+            case "$key" in
+                token)        token="$val" ;;
+                display-name) display_name="$val" ;;
+                selection)    selection="$val" ;;
+                data)
+                    # Derive a safe local filename.
+                    local basename
+                    if [[ -n "$display_name" && "$display_name" == *:* ]]; then
+                        basename="${display_name##*:}"    # strip "host:" prefix
+                        basename="${basename##*/}"        # keep basename only
+                    else
+                        basename="${token##*/}"
+                    fi
+                    [[ -z "$basename" || "$basename" == "-" ]] && basename="untitled"
+
+                    temp_path="${_session_dir}/${basename}"
+                    # Read exactly val bytes from stdin (the socket) into the file.
+                    # The blank-line terminator after the data is consumed by the
+                    # next read iteration of this while loop.
+                    dd bs=1 count="$val" of="$temp_path" 2>/dev/null
+                    ;;
+            esac
+        done
+
+        # Handle empty/new file (open with no data header).
+        if [[ -z "$temp_path" ]]; then
+            local basename="${token##*/}"
+            [[ -z "$basename" || "$basename" == "-" ]] && basename="untitled"
+            temp_path="${_session_dir}/${basename}"
+            touch "$temp_path"
+        fi
+
+        log "open  token=$token  file=${temp_path##*/}"
+
+        open_in_editor "$temp_path" "$selection"
+
+        # Watch for saves in a background subshell; sends file contents back
+        # over stdout (=socket) on each close_write inotify event.
+        # inotifywait -qq exits 0 on event, non-zero if the file disappears.
+        (
+            while inotifywait -qq -e close_write "$temp_path" 2>/dev/null; do
+                log "save  token=$token"
+                send_save "$temp_path" "$token"
+            done
+        ) &
+
+        _tokens+=("$token")
+        _temp_paths+=("$temp_path")
+        _watcher_pids+=("$!")
+    done
+
+    # Reached EOF on stdin — connection dropped; EXIT trap handles cleanup.
+}
+
+# --- Listener ---
+
+_start_listener() {
+    # socat forks per connection; each fork re-execs this script with
+    # --handle-connection, which wires stdin/stdout to the socket.
+    local handler_cmd
+    handler_cmd="$(printf '%q' "$SELF") --handle-connection"
+    exec socat \
+        "TCP-LISTEN:${RMATE_PORT},bind=${RMATE_HOST},reuseaddr,fork" \
+        "EXEC:${handler_cmd}"
+}
+
+# --- Subcommands ---
+
+cmd_start() {
+    if [[ -f "$PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$PID_FILE" 2>/dev/null)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            die "rmate-server is already running (PID $pid)"
+        fi
+        rm -f "$PID_FILE"
+    fi
+
+    log "starting on ${RMATE_HOST}:${RMATE_PORT}  editor=${RMATE_EDITOR}"
+    _start_listener >> "$LOG_FILE" 2>&1 &
+    disown
+    echo $! > "$PID_FILE"
+    echo "rmate-server started (PID $!)"
+}
+
+cmd_stop() {
+    [[ -f "$PID_FILE" ]] || die "rmate-server is not running (no PID file)"
+    local pid
+    pid=$(cat "$PID_FILE")
+    if ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$PID_FILE"
+        die "stale PID file removed; server was not running"
+    fi
+    kill "$pid" && rm -f "$PID_FILE"
+    echo "rmate-server stopped"
+}
+
+cmd_status() {
+    if [[ ! -f "$PID_FILE" ]]; then
+        echo "rmate-server: not running"
+        exit 1
+    fi
+    local pid
+    pid=$(cat "$PID_FILE")
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "rmate-server: running (PID $pid, port ${RMATE_PORT})"
+    else
+        rm -f "$PID_FILE"
+        echo "rmate-server: not running (stale PID file removed)"
+        exit 1
+    fi
+}
+
+cmd_foreground() {
+    log "starting (foreground) on ${RMATE_HOST}:${RMATE_PORT}  editor=${RMATE_EDITOR}"
+    echo "rmate-server ${VERSION} listening on ${RMATE_HOST}:${RMATE_PORT}  editor=${RMATE_EDITOR}" >&2
+    _start_listener
+}
+
+# --- Argument parsing and dispatch ---
+
+SUBCMD="${1:-start}"
+shift 2>/dev/null || true
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -H|--host)   RMATE_HOST="$2";   shift 2 ;;
+        -p|--port)   RMATE_PORT="$2";   shift 2 ;;
+        -e|--editor) RMATE_EDITOR="$2"; shift 2 ;;
+        -h|--help)   usage ;;
+        --)          shift; break ;;
+        -*)          die "unknown option: $1" ;;
+        *)           break ;;
+    esac
+done
+
+# Export so socat's re-exec subprocess inherits current config.
+export RMATE_HOST RMATE_PORT RMATE_EDITOR
+
+case "$SUBCMD" in
+    start)               cmd_start ;;
+    stop)                cmd_stop ;;
+    status)              cmd_status ;;
+    foreground|fg)       cmd_foreground ;;
+    --handle-connection) handle_connection ;;
+    help|-h|--help)      usage ;;
+    *)                   die "unknown command: $SUBCMD (try: start|stop|status|foreground)" ;;
+esac
