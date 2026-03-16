@@ -56,6 +56,11 @@ SSH setup:
   ssh -R 52698:localhost:52698 user@remote-host
   # then on remote: rmate file.txt
 
+Remote usage:
+  Set EDITOR variable on the remote to use rmate as the default editor:
+  export EDITOR="rmate -w"
+  # now git commit, less, sudoedit, etc. will open files in your local editor
+
 Commands:
   start       Start server in background (default)
   stop        Stop background server
