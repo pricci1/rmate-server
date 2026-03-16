@@ -50,3 +50,8 @@ Configuration can be set via:
 ## Remote client
 
 Use [aurora/rmate](https://github.com/aurora/rmate) on the remote machine to connect to this server.
+
+## References
+
+- https://github.com/rafaelmaiolla/remote-vscode
+- https://github.com/randy3k/RemoteSubl
